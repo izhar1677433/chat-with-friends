@@ -17,6 +17,7 @@ app.use("/api/friends", require("./src/routes/friends"));
 app.use("/api/messages", require("./src/routes/messages"));
 
 // MongoDB
+console.log('DEBUG MONGO_URI:', process.env.MONGO_URI);
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected"))
@@ -44,6 +45,17 @@ io.on("connection", (socket) => {
   console.log("User online:", socket.userId);
 
   socket.on("sendMessage", ({ to, text }) => {
+    // If message is addressed to the bot user id 'bot' or contains '/bot', respond from server-side bot
+    const isBot = String(to) === 'bot' || (typeof text === 'string' && text.trim().startsWith('/bot'))
+    if (isBot) {
+      console.log('Bot received message from', socket.userId, text)
+      // simple bot response logic (echo with prefix)
+      const reply = `Bot: I received your message: "${text.replace('/bot', '').trim()}"`;
+      // send reply back to sender
+      io.to(socket.id).emit('receiveMessage', { from: 'bot', text: reply })
+      return
+    }
+
     const receiverSocketId = onlineUsers.getSocketId(to);
     if (receiverSocketId) {
       io.to(receiverSocketId).emit("receiveMessage", {
