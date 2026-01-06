@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const auth = require("../middleware/authMiddleware");
+const auth = require("../middleware/auth");
 const User = require("../models/User");
 const online = require("../onlineUsers");
 
@@ -11,10 +11,10 @@ router.get("/friends-status", auth, async (req, res) => {
 
     const friendsStatus = await Promise.all(
       friendsIds.map(async (friendId) => {
-        const user = await User.findById(friendId).select("username email");
+        const user = await User.findById(friendId).select("name email");
         return {
           id: friendId,
-          username: user?.username || "Unknown",
+          username: user?.name || "Unknown",
           email: user?.email || "Unknown",
           online: online.isOnline(friendId),
         };

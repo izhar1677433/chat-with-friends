@@ -3,6 +3,8 @@ const router = express.Router();
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const onlineUsers = require("../onlineUsers");
+const auth = require("../middleware/auth");
 
 // Signup
 router.post("/signup", async (req, res) => {
@@ -16,8 +18,11 @@ router.post("/signup", async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
     const user = await User.create({ name, email: email.trim().toLowerCase(), password: hashed });
 
-    res.status(201).json({ user: { id: user._id, name: user.name, email: user.email } });
+    res.status(201).json({
+      user: { id: user._id, name: user.name, email: user.email }
+    });
   } catch (err) {
+    console.error("Signup error:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -35,8 +40,35 @@ router.post("/login", async (req, res) => {
     if (!ok) return res.status(400).json({ message: "Invalid credentials" });
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || "secret123");
+
     res.json({ token, user: { id: user._id, name: user.name, email: user.email } });
   } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// Get current user
+router.get('/me', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('_id name email');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json({ user });
+  } catch (err) {
+    console.error('Get current user error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Logout
+router.post("/logout", auth, async (req, res) => {
+  try {
+    // Mark user as offline
+    onlineUsers.remove(req.user._id.toString());
+
+    res.json({ message: "Logged out successfully" });
+  } catch (err) {
+    console.error("Logout error:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
