@@ -28,6 +28,42 @@ app.get('/api/debug/online', auth, (req, res) => {
   }
 });
 
+// Check and auto-fix one-way friendships
+app.get('/api/debug/fix-friendships', auth, async (req, res) => {
+  try {
+    const User = require('./src/models/User');
+    const me = await User.findById(req.user._id).populate('friends', 'name email friends');
+    const issues = [];
+    const fixed = [];
+
+    for (const friend of me.friends) {
+      const friendHasMe = friend.friends.some(id => String(id) === String(me._id));
+      if (!friendHasMe) {
+        issues.push({
+          friend: { id: friend._id, name: friend.name },
+          problem: `One-way friendship: You have ${friend.name} but they don't have you`
+        });
+        // Auto-fix: add me to their friends list
+        friend.friends.push(me._id);
+        await friend.save();
+        fixed.push({ friend: friend.name, action: 'Added you to their friends list ✅' });
+      }
+    }
+
+    return res.json({
+      user: { id: me._id, name: me.name, friendsCount: me.friends.length },
+      issues: issues.length > 0 ? issues : undefined,
+      fixed: fixed.length > 0 ? fixed : undefined,
+      message: fixed.length > 0
+        ? `✅ Fixed ${fixed.length} one-way friendship(s)! Refresh both clients.`
+        : '✅ All friendships are bidirectional!'
+    });
+  } catch (err) {
+    console.error('Fix friendships error:', err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Detailed sockets debug (includes per-socket rooms and handshake info)
 app.get('/api/debug/sockets', auth, (req, res) => {
   try {
@@ -137,13 +173,12 @@ io.on("connection", (socket) => {
     try {
       console.log(`✅ Handshake auth successful for userId: ${socket.userId}`);
       onlineUsers.add(socket.userId, socket.id);
-      // Join user-specific room for targeted events
       socket.join(`user:${socket.userId}`);
       console.log(`✅ Socket ${socket.id} joined room: user:${socket.userId}`);
-      console.log(`📊 User ${socket.userId} is now online (handshake) with socket: ${socket.id}`);
 
-      // Notify all friends that this user is now online
-      notifyFriendsOnlineStatus(socket.userId, true);
+      // Single broadcast after registration (notifyFriendsOnlineStatus will be called by user-online event)
+      io.emit('online-users', Object.keys(onlineUsers.list()));
+      console.log('📢 Broadcasted online users to all clients');
     } catch (e) { console.error('❌ Error in handshake registration:', e) }
   } else {
     console.log(`⏳ Socket ${socket.id} connected without userId, waiting for register event`)
@@ -174,19 +209,41 @@ io.on("connection", (socket) => {
 
       socket.userId = userId;
       onlineUsers.add(userId, socket.id);
-      // Join user-specific room for targeted events
       socket.join(`user:${userId}`);
       console.log('✅ User joined room: user:' + userId);
 
-      // Notify all friends that this user is now online
-      notifyFriendsOnlineStatus(userId, true);
-
       console.log('register: socket registered', socket.id, 'userId:', userId)
-      // acknowledge registration to client
       socket.emit('registered')
+      // Note: user-online event will handle the broadcast
     } catch (err) {
       console.error('register handler error', err && err.message)
     }
+  })
+
+  // Explicit user-online event (single source of truth for broadcasts)
+  socket.on('user-online', (userId) => {
+    if (!userId) return console.log('⚠️ user-online: no userId provided');
+
+    const uid = String(userId);
+    console.log(`📢 user-online event received: userId=${uid}, socketId=${socket.id}`);
+
+    // If socket doesn't have userId yet, set it now
+    if (!socket.userId) {
+      socket.userId = uid;
+      socket.join(`user:${uid}`);
+      console.log(`✅ Socket ${socket.id} set userId via user-online: ${uid}`);
+    }
+
+    // Ensure user is in online users map
+    onlineUsers.add(uid, socket.id);
+
+    // Wait a bit to avoid race conditions with disconnect events
+    setTimeout(() => {
+      // Notify friends and broadcast (single authoritative broadcast)
+      notifyFriendsOnlineStatus(uid, true);
+      io.emit('online-users', Object.keys(onlineUsers.list()));
+      console.log('📢 Broadcasted online users:', Object.keys(onlineUsers.list()));
+    }, 100);
   })
 
 
@@ -294,6 +351,10 @@ io.on("connection", (socket) => {
     // Notify all friends that this user is now offline (only if no other sockets)
     if (userId && !onlineUsers.isOnline(userId)) {
       notifyFriendsOnlineStatus(userId, false);
+
+      // Broadcast updated online users list to ALL clients
+      io.emit('online-users', Object.keys(onlineUsers.list()));
+      console.log('📢 Broadcasted online users to all clients (user offline)');
     }
   });
 });
