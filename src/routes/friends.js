@@ -49,12 +49,12 @@ router.post("/add", auth, async (req, res) => {
       const room = `user:${friend._id.toString()}`;
       const acceptSocks = onlineUsers.getSocketIds(friend._id);
       console.log('Auto-accept notify target (room):', room, 'socketIds:', acceptSocks)
-      if (global.io) {
+      if (io) {
         // emit to room
-        global.io.to(room).emit('friendAccepted', { from: me._id.toString(), name: me.name });
+        io.to(room).emit('friendAccepted', { from: me._id.toString(), name: me.name });
         // also emit to individual sockets as a fallback
         acceptSocks.forEach(sid => {
-          try { global.io.to(sid).emit('friendAccepted', { from: me._id.toString(), name: me.name }) } catch (e) { console.error('emit to sock failed', sid, e) }
+          try { io.to(sid).emit('friendAccepted', { from: me._id.toString(), name: me.name }) } catch (e) { console.error('emit to sock failed', sid, e) }
         })
       }
 

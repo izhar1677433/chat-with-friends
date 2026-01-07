@@ -83,6 +83,34 @@ const io = new Server(server, { cors: { origin: "*" } });
 // make io available to route handlers if needed
 global.io = io;
 
+// Helper function to notify friends when a user goes online/offline
+async function notifyFriendsOnlineStatus(userId, isOnline) {
+  try {
+    const User = require('./src/models/User');
+    const user = await User.findById(userId).select('friends name');
+    console.log(`📡 notifyFriendsOnlineStatus: userId=${userId}, name=${user?.name}, isOnline=${isOnline}, friendsCount=${user?.friends?.length || 0}`);
+
+    if (!user || !user.friends || user.friends.length === 0) {
+      console.log(`⚠️ User ${userId} has no friends to notify`);
+      return;
+    }
+
+    // Emit to each friend's room
+    user.friends.forEach(friendId => {
+      const friendRoom = `user:${friendId.toString()}`;
+      console.log(`  → Emitting friendOnlineStatus to room: ${friendRoom}, payload: { userId: ${userId.toString()}, online: ${isOnline} }`);
+      io.to(friendRoom).emit('friendOnlineStatus', {
+        userId: userId.toString(),
+        online: isOnline
+      });
+    });
+
+    console.log(`✅ Notified ${user.friends.length} friends that ${user.name} is ${isOnline ? 'online' : 'offline'}`);
+  } catch (err) {
+    console.error('❌ Error notifying friends online status:', err);
+  }
+}
+
 io.use((socket, next) => {
   // Try to decode token if present on handshake, but allow connections without it.
   const token = socket.handshake.auth && socket.handshake.auth.token;
@@ -102,12 +130,23 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket) => {
+  console.log(`🔌 New socket connection: ${socket.id}`);
+
   // If userId was set during handshake, register immediately
   if (socket.userId) {
-    try { onlineUsers.add(socket.userId, socket.id); } catch (e) { console.error(e) }
-    console.log("User online (handshake):", socket.userId, 'socket:', socket.id);
+    try {
+      console.log(`✅ Handshake auth successful for userId: ${socket.userId}`);
+      onlineUsers.add(socket.userId, socket.id);
+      // Join user-specific room for targeted events
+      socket.join(`user:${socket.userId}`);
+      console.log(`✅ Socket ${socket.id} joined room: user:${socket.userId}`);
+      console.log(`📊 User ${socket.userId} is now online (handshake) with socket: ${socket.id}`);
+
+      // Notify all friends that this user is now online
+      notifyFriendsOnlineStatus(socket.userId, true);
+    } catch (e) { console.error('❌ Error in handshake registration:', e) }
   } else {
-    console.log('Socket connected without userId, waiting for register event. socket:', socket.id)
+    console.log(`⏳ Socket ${socket.id} connected without userId, waiting for register event`)
   }
 
   // Allow clients to explicitly register after connect (fallback)
@@ -120,6 +159,9 @@ io.on("connection", (socket) => {
         if (!userIdFallback) return console.log('register: no token or userId provided')
         socket.userId = String(userIdFallback);
         onlineUsers.add(socket.userId, socket.id);
+        // Join user-specific room for targeted events
+        socket.join(`user:${socket.userId}`);
+        console.log('✅ User joined room: user:' + socket.userId);
         console.log('register (fallback): socket registered', socket.id, 'userId:', socket.userId)
         socket.emit('registered')
         return
@@ -132,6 +174,13 @@ io.on("connection", (socket) => {
 
       socket.userId = userId;
       onlineUsers.add(userId, socket.id);
+      // Join user-specific room for targeted events
+      socket.join(`user:${userId}`);
+      console.log('✅ User joined room: user:' + userId);
+
+      // Notify all friends that this user is now online
+      notifyFriendsOnlineStatus(userId, true);
+
       console.log('register: socket registered', socket.id, 'userId:', userId)
       // acknowledge registration to client
       socket.emit('registered')
@@ -206,6 +255,13 @@ io.on("connection", (socket) => {
         console.log('⚠️ Receiver offline - message saved to DB, will sync when online')
       }
 
+      // Fallback: emit to receiver's user room to ensure delivery even if map is stale
+      try {
+        const roomName = `user:${String(to)}`;
+        console.log('   → Emitting newMessage to receiver room:', roomName)
+        io.to(roomName).emit('newMessage', savedPayload);
+      } catch (e) { console.error('room emit to receiver failed', e) }
+
       // Send to sender (for multi-tab/device sync)
       if (senderSocketIds.length > 0) {
         senderSocketIds.forEach(socketId => {
@@ -214,6 +270,12 @@ io.on("connection", (socket) => {
         });
         console.log('✅ Sent to sender:', senderSocketIds.length, 'socket(s)')
       }
+
+      // Also emit to sender's user room as extra redundancy
+      try {
+        const senderRoom = `user:${String(socket.userId)}`;
+        io.to(senderRoom).emit('newMessage', savedPayload);
+      } catch (e) { console.error('room emit to sender failed', e) }
 
       // ✅ Acknowledge to sender
       if (typeof ack === 'function') ack({ ok: true, data: savedPayload });
@@ -225,8 +287,14 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
+    const userId = socket.userId;
     try { onlineUsers.remove(socket.userId, socket.id); } catch (e) { }
     console.log("User disconnected:", socket.userId, socket.id);
+
+    // Notify all friends that this user is now offline (only if no other sockets)
+    if (userId && !onlineUsers.isOnline(userId)) {
+      notifyFriendsOnlineStatus(userId, false);
+    }
   });
 });
 
