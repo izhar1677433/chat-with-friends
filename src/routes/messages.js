@@ -59,9 +59,22 @@ router.post("/send",
       const files = req.files || [];
       console.log('📨 REST /send:', { from: req.user._id, to: receiver, text: text ? text.substring(0, 20) + '...' : null, files: files.length })
 
-      if (!receiver || (!text && files.length === 0)) {
-        console.log('❌ REST /send: missing fields')
-        return res.status(400).json({ message: "receiver and (text or attachments) are required", received: req.body });
+      // Basic validation (robust): ensure either trimmed text or at least one uploaded file
+      const hasText = typeof text === 'string' && String(text).trim().length > 0;
+      const hasFiles = Array.isArray(files) && files.length > 0;
+      if (!receiver || (!hasText && !hasFiles)) {
+        console.log('❌ REST /send: missing fields', { receiver, hasText, files: files.length });
+        return res.status(400).json({
+          message: "receiver and (text or attachments) are required",
+          received: { body: req.body, files: (req.files || []).map(f => f.fieldname) }
+        });
+      }
+
+      // Validate receiver is a valid ObjectId to avoid Mongoose CastError
+      const mongoose = require('mongoose');
+      if (!mongoose.Types.ObjectId.isValid(String(receiver))) {
+        console.log('❌ REST /send: invalid receiver id', receiver)
+        return res.status(400).json({ message: 'Invalid receiver id' });
       }
 
       // Validate: prevent sending to self
@@ -71,51 +84,95 @@ router.post("/send",
       }
 
       // Find sender (logged-in user)
-      const senderUser = await User.findById(req.user._id);
+      let senderUser = null
+      try { senderUser = await User.findById(req.user._id) } catch (e) { console.error('DB error finding sender', e); return res.status(500).json({ message: 'Server error finding sender' }) }
       if (!senderUser) return res.status(404).json({ message: "Sender not found" });
 
       // Find receiver
-      const receiverUser = await User.findById(receiver);
+      let receiverUser = null
+      try { receiverUser = await User.findById(receiver) } catch (e) { console.error('DB error finding receiver', e); return res.status(500).json({ message: 'Server error finding receiver' }) }
       if (!receiverUser) return res.status(404).json({ message: "Receiver not found" });
 
       // Map uploaded files to attachment metadata
-      const attachments = (req.files || []).map((f) => {
-        let kind = "file";
-        if (f.mimetype && f.mimetype.startsWith("image/")) kind = "image";
-        else if (f.mimetype && f.mimetype.startsWith("video/")) kind = "video";
-        return {
-          filename: f.filename,
-          originalName: f.originalname,
-          mimeType: f.mimetype,
-          size: f.size,
-          url: `/uploads/${f.filename}`,
-          type: kind
-        };
-      });
+      let attachments = []
+      try {
+        attachments = (req.files || []).map((f) => {
+          let kind = "file";
+          if (f.mimetype && f.mimetype.startsWith("image/")) kind = "image";
+          else if (f.mimetype && f.mimetype.startsWith("video/")) kind = "video";
+          return {
+            filename: f.filename,
+            originalName: f.originalname,
+            mimeType: f.mimetype,
+            size: f.size,
+            url: `/uploads/${f.filename}`,
+            type: kind
+          };
+        })
+      } catch (e) {
+        console.error('Error processing uploaded files', e)
+        return res.status(500).json({ message: 'Error processing uploaded files' })
+      }
 
       // Create message (DB only - we will also emit via Socket.IO so REST clients receive realtime notifications)
-      // Ensure `text` is always defined (allow attachment-only messages)
-      const message = await Message.create({
-        sender: senderUser._id,
-        receiver: receiverUser._id,
-        text: text || '',
-        attachments
-      });
+      // Use trimmed text and existing `attachments` array
+      let message = null
+      try {
+        const hasText = typeof text === "string" && text.trim().length > 0;
+        const hasFiles = attachments && attachments.length > 0;
+        if (!hasText && !hasFiles) {
+          return res.status(400).json({ message: "text ya attachment lazmi hai" });
+        }
 
-      console.log('✅ REST: Message saved to DB:', message._id)
+        // Build payload using model-ready values (senderUser._id and receiverUser._id are ObjectIds)
+        const createPayload = {
+          sender: senderUser._id,
+          receiver: receiverUser._id,
+          attachments
+        };
+        if (hasText) createPayload.text = String(text).trim();
+
+        // Insert into DB
+        message = await Message.create(createPayload);
+        console.log('✅ REST: Message saved to DB:', message._id)
+      } catch (e) {
+        console.error('❌ REST: failed to create message', e)
+        if (e && e.name === 'ValidationError') {
+          const errors = {}
+          Object.keys(e.errors || {}).forEach(k => {
+            const it = e.errors[k]
+            errors[k] = {
+              message: it.message,
+              kind: it.kind,
+              path: it.path,
+              value: it.value
+            }
+          })
+          console.error('Validation errors:', errors)
+          return res.status(400).json({ message: 'Validation error', errors })
+        }
+        return res.status(500).json({ message: 'Server error creating message', error: e && e.message ? e.message : String(e) })
+      }
 
       // Try to emit via Socket.IO so receiver(s) get notified in real-time
       try {
         const io = global.io;
         const onlineUsers = require('../onlineUsers');
+        const clientTempId = req.body.clientTempId || req.body.client_temp_id || req.body.tempId || undefined;
         const savedPayload = {
           _id: String(message._id),
-          text: message.text,
+          clientTempId: clientTempId,
           sender: String(message.sender),
           receiver: String(message.receiver),
           createdAt: message.timestamp || message.createdAt || new Date().toISOString(),
           attachments: Array.isArray(message.attachments) ? message.attachments : []
         };
+        // Only include `text` in payload when it's non-empty so clients treat it as optional
+
+
+
+
+        if (message.text && String(message.text).trim().length > 0) savedPayload.text = message.text;
 
         // Emit directly to any known socket ids for the receiver
         const receiverSocketIds = onlineUsers.getSocketIds(String(receiverUser._id)) || [];
@@ -137,7 +194,12 @@ router.post("/send",
         console.error('❌ REST: failed to emit newMessage via Socket.IO:', emitErr)
       }
 
-      return res.json({ message: "Message sent successfully", data: message });
+      // Include clientTempId in response data so client can reconcile optimistic message
+      const respData = (message && message.toObject) ? message.toObject() : message;
+      // Remove empty text so client treats text as optional
+      if (respData && (!respData.text || String(respData.text).trim() === '')) delete respData.text;
+      if (respData) respData.clientTempId = clientTempId;
+      return res.json({ message: "Message sent successfully", data: respData });
     } catch (err) {
       console.error("Send message error:", err);
       if (err && err.name === 'ValidationError') {
