@@ -4,7 +4,7 @@ const MessageSchema = new mongoose.Schema({
   sender: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   receiver: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true }, // MUST MATCH FIELD
   // `text` is optional — omit the field entirely for attachment-only messages
-text: { type: String, required: true },
+text: { type: String, },
   timestamp: { type: Date, default: Date.now },
   attachments: {
     type: [
