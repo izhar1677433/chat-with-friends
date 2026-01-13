@@ -6,29 +6,25 @@ const auth = require("../middleware/auth"); // your auth middleware
 const User = require("../models/User");
 const Message = require("../models/Message");
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+const streamifier = require('streamifier');
+const cloudinary = require('../config/cloudinary');
 
-const uploadDir = path.join(__dirname, "..", "uploads");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const ext = path.extname(file.originalname);
-    const name = Date.now() + "-" + Math.round(Math.random() * 1e9) + ext;
-    cb(null, name);
-  }
-});
-
+// Use memory storage so we can upload buffers to Cloudinary
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 } // 50 MB per file
 });
+
+// Helper: upload a Buffer to Cloudinary using upload_stream
+function uploadBufferToCloudinary(buffer, originalName, options = {}) {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream({ resource_type: 'auto', folder: 'chat_attachments', use_filename: true, unique_filename: true, ...options }, (error, result) => {
+      if (error) return reject(error);
+      resolve(result);
+    });
+    streamifier.createReadStream(buffer).pipe(uploadStream);
+  });
+}
 
 // --------------------------
 // POST /api/messages/send
@@ -55,7 +51,11 @@ router.post("/send",
     try {
       // Accept multiple possible body shapes for robustness
       const receiver = req.body.receiver || req.body.to || req.body.receiverId || req.body.toId;
-      const text = req.body.text || req.body.message || req.body.content;
+      let text = req.body.text || req.body.message || req.body.content;
+if (typeof text === "string" && text.trim() === "") {
+  text = undefined; // 🔥 EMPTY STRING KILL
+}
+
       const files = req.files || [];
       console.log('📨 REST /send:', { from: req.user._id, to: receiver, text: text ? text.substring(0, 20) + '...' : null, files: files.length })
 
@@ -93,25 +93,33 @@ router.post("/send",
       try { receiverUser = await User.findById(receiver) } catch (e) { console.error('DB error finding receiver', e); return res.status(500).json({ message: 'Server error finding receiver' }) }
       if (!receiverUser) return res.status(404).json({ message: "Receiver not found" });
 
-      // Map uploaded files to attachment metadata
+      // Map uploaded files -> upload each to Cloudinary and build attachment metadata
       let attachments = []
       try {
-        attachments = (req.files || []).map((f) => {
-          let kind = "file";
-          if (f.mimetype && f.mimetype.startsWith("image/")) kind = "image";
-          else if (f.mimetype && f.mimetype.startsWith("video/")) kind = "video";
-          return {
-            filename: f.filename,
-            originalName: f.originalname,
-            mimeType: f.mimetype,
-            size: f.size,
-            url: `/uploads/${f.filename}`,
-            type: kind
-          };
-        })
+        const files = req.files || [];
+        if (files.length > 0) {
+          const uploadPromises = files.map(async (f) => {
+            const kind = (f.mimetype && f.mimetype.startsWith('image/')) ? 'image' : (f.mimetype && f.mimetype.startsWith('video/')) ? 'video' : 'file';
+            // Upload buffer to Cloudinary
+            const result = await uploadBufferToCloudinary(f.buffer, f.originalname, {});
+            return {
+              filename: result.public_id || f.originalname || '',
+              originalName: String(f.originalname || ''),
+              mimeType: String(f.mimetype || ''),
+              size: Number(f.size || 0),
+              url: result.secure_url || result.url || '',
+              type: kind,
+              providerResponse: {
+                provider: 'cloudinary',
+                raw: result
+              }
+            };
+          });
+          attachments = await Promise.all(uploadPromises);
+        }
       } catch (e) {
-        console.error('Error processing uploaded files', e)
-        return res.status(500).json({ message: 'Error processing uploaded files' })
+        console.error('Error uploading files to Cloudinary', e)
+        return res.status(500).json({ message: 'Error uploading attachments' })
       }
 
       // Create message (DB only - we will also emit via Socket.IO so REST clients receive realtime notifications)
@@ -119,24 +127,25 @@ router.post("/send",
       let message = null
       try {
         const hasText = typeof text === "string" && text.trim().length > 0;
-        const hasFiles = attachments && attachments.length > 0;
-        if (!hasText && !hasFiles) {
-          return res.status(400).json({ message: "text ya attachment lazmi hai" });
-        }
 
         // Build payload using model-ready values (senderUser._id and receiverUser._id are ObjectIds)
         const createPayload = {
           sender: senderUser._id,
           receiver: receiverUser._id,
-          attachments
+          attachments: Array.isArray(attachments) ? attachments : []
         };
         if (hasText) createPayload.text = String(text).trim();
+
+        // Log payload for debugging validation issues (will not include raw file buffers)
+        try { console.log('REST /send createPayload:', { sender: String(createPayload.sender), receiver: String(createPayload.receiver), text: createPayload.text ? createPayload.text.substring(0, 50) : null, attachmentsCount: createPayload.attachments.length }) } catch (e) { console.warn('Failed to log createPayload', e) }
 
         // Insert into DB
         message = await Message.create(createPayload);
         console.log('✅ REST: Message saved to DB:', message._id)
       } catch (e) {
         console.error('❌ REST: failed to create message', e)
+        // Always log full error for troubleshooting
+        console.error('Full error object:', e)
         if (e && e.name === 'ValidationError') {
           const errors = {}
           Object.keys(e.errors || {}).forEach(k => {
@@ -153,12 +162,12 @@ router.post("/send",
         }
         return res.status(500).json({ message: 'Server error creating message', error: e && e.message ? e.message : String(e) })
       }
-
+      let clientTempId = req.body.clientTempId || req.body.client_temp_id || req.body.tempId || undefined;
       // Try to emit via Socket.IO so receiver(s) get notified in real-time
       try {
         const io = global.io;
         const onlineUsers = require('../onlineUsers');
-        const clientTempId = req.body.clientTempId || req.body.client_temp_id || req.body.tempId || undefined;
+
         const savedPayload = {
           _id: String(message._id),
           clientTempId: clientTempId,
