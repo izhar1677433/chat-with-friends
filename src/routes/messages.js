@@ -43,6 +43,14 @@ router.post("/send",
       // Log received file fieldnames for debugging
       if (Array.isArray(req.files) && req.files.length > 0) {
         console.log('MULTER: received files fields:', req.files.map(f => ({ field: f.fieldname, originalname: f.originalname })))
+
+        // Enforce media-specific size limit: max 10 MB per image or video
+        const MAX_MEDIA_BYTES = 10 * 1024 * 1024; // 10 MB
+        const oversizedMedia = req.files.filter(f => f && f.mimetype && (f.mimetype.startsWith('image/') || f.mimetype.startsWith('video/')) && (f.size || 0) > MAX_MEDIA_BYTES);
+        if (oversizedMedia.length > 0) {
+          console.log('MULTER: media size limit exceeded for files:', oversizedMedia.map(f => ({ field: f.fieldname, originalname: f.originalname, size: f.size })));
+          return res.status(400).json({ message: 'the file is larger then 10mb' });
+        }
       }
       next();
     })
@@ -52,9 +60,9 @@ router.post("/send",
       // Accept multiple possible body shapes for robustness
       const receiver = req.body.receiver || req.body.to || req.body.receiverId || req.body.toId;
       let text = req.body.text || req.body.message || req.body.content;
-if (typeof text === "string" && text.trim() === "") {
-  text = undefined; // 🔥 EMPTY STRING KILL
-}
+      if (typeof text === "string" && text.trim() === "") {
+        text = undefined; // 🔥 EMPTY STRING KILL
+      }
 
       const files = req.files || [];
       console.log('📨 REST /send:', { from: req.user._id, to: receiver, text: text ? text.substring(0, 20) + '...' : null, files: files.length })
