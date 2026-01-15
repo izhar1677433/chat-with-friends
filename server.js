@@ -1,3 +1,4 @@
+
 const express = require("express");
 const path = require("path");
 const mongoose = require("mongoose");
@@ -19,8 +20,7 @@ app.use("/api/auth", require("./src/routes/auth"));
 app.use("/api/friends", require("./src/routes/friends"));
 app.use("/api/messages", require("./src/routes/messages"));
 app.use("/api/online", require("./src/routes/onlineRoutes"));
-app.use("/api/calls", require("./src/routes/calls"));
-app.use("/api/webrtc", require("./src/routes/webrtc"));
+
 
 // Debug route: dump online users mapping (protected)
 app.get('/api/debug/online', auth, (req, res) => {
@@ -123,6 +123,9 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 // make io available to route handlers if needed
 global.io = io;
+
+// Simple map for quick userId -> single socketId lookup (used by some clients)
+const userSockets = new Map();
 
 // Helper function to notify friends when a user goes online/offline
 async function notifyFriendsOnlineStatus(userId, isOnline) {
@@ -251,6 +254,84 @@ io.on("connection", (socket) => {
     }, 100);
   })
 
+  // Allow clients to identify with a simple userId (some frontends emit 'identify')
+  socket.on('identify', (userId) => {
+    try {
+      if (!userId) return;
+      const uid = String(userId);
+      userSockets.set(uid, socket.id);
+      socket.userId = uid;
+      // keep onlineUsers in sync as well
+      try { onlineUsers.add(uid, socket.id); } catch (e) { }
+      socket.join(`user:${uid}`);
+      console.log(`identify: mapped user ${uid} -> socket ${socket.id}`);
+    } catch (err) { console.error('identify handler error', err); }
+  });
+
+  // Forward helper: send event to target by explicit socket id or userId
+  const forward = (eventName, payload, ack) => {
+    try {
+      const targetSocketId = (payload && (payload.toSocket || payload.to))
+        ? (payload.toSocket || userSockets.get(String(payload.to)))
+        : null;
+
+      // fallback to onlineUsers lookup
+      const resolved = targetSocketId || (payload && userSockets.get(String(payload.to))) || (payload && onlineUsers.getSocketId && onlineUsers.getSocketId(String(payload.to))) || (payload && (onlineUsers.getSocketIds && (onlineUsers.getSocketIds(String(payload.to)) || [])[0]));
+
+      if (!resolved) {
+        if (ack) ack({ ok: false, reason: 'target-not-online' });
+        return;
+      }
+
+      io.to(resolved).emit(eventName, payload);
+      if (ack) ack({ ok: true });
+    } catch (err) {
+      console.error('forward error', err);
+      if (ack) ack({ ok: false, reason: 'server-error' });
+    }
+  };
+
+  // Normalize and forward common signaling events
+  socket.on('webrtc-offer', (payload, ack) => forward('webrtc-offer', payload, ack));
+  socket.on('call:offer', (payload, ack) => forward('webrtc-offer', payload, ack));
+  socket.on('webrtc-answer', (payload, ack) => forward('webrtc-answer', payload, ack));
+  socket.on('ice-candidate', (payload, ack) => forward('ice-candidate', payload, ack));
+
+  // Handle legacy/webrtc-offer event name (forward offer to receiver and ACK caller)
+  socket.on('webrtc-offer', async (data, callback) => {
+    try {
+      console.log('📞 webrtc-offer received:', {
+        from: data && data.from,
+        to: data && data.to,
+        type: data && data.type
+      });
+
+      const to = data && (data.to || data.target);
+      if (!to) {
+        if (typeof callback === 'function') callback({ success: false, error: 'missing recipient' });
+        return;
+      }
+
+      const receiverSocketId = (onlineUsers.getSocketId && onlineUsers.getSocketId(String(to))) || (onlineUsers.getSocketIds && (onlineUsers.getSocketIds(String(to)) || [])[0]);
+
+      if (receiverSocketId) {
+        io.to(receiverSocketId).emit('webrtc-offer', {
+          from: data.from || socket.userId || socket.id,
+          to: String(to),
+          type: data.type,
+          sdp: data.sdp,
+          timestamp: new Date()
+        });
+        if (typeof callback === 'function') callback({ success: true, message: 'Offer forwarded' });
+      } else {
+        if (typeof callback === 'function') callback({ success: false, error: 'User offline' });
+      }
+    } catch (err) {
+      console.error('webrtc-offer handler error', err);
+      if (typeof callback === 'function') callback({ success: false, error: 'server error' });
+    }
+  });
+
 
   socket.on("sendMessage", async (payload, ack) => {
     // Accept either { to, text } or { receiver, text } or full message object
@@ -258,6 +339,85 @@ io.on("connection", (socket) => {
     const text = payload && (payload.text || payload.message || payload.content);
     const clientTempId = payload && (payload.clientTempId || payload._id || payload.tempId)
     console.log('📨 sendMessage:', { from: socket.userId, to, text: text?.substring(0, 20) + '...', socketId: socket.id })
+
+    // --------------------------
+    // Simple voice call handlers (signaling + binary relay)
+    // - start-voice-call: notify target(s) or room that call is starting
+    // - voice-chunk: relay binary audio chunks to target(s) or room
+    // - stop-voice-call: notify end of call
+    // Accepts either { to: <userId> } or { roomId: <roomId> }
+    // --------------------------
+    socket.on('start-voice-call', (payload, ack) => {
+      try {
+        const to = payload && (payload.to || payload.target || payload.userId);
+        const roomId = payload && payload.roomId;
+        const metadata = payload && payload.metadata;
+        if (!to && !roomId) {
+          if (typeof ack === 'function') ack({ ok: false, message: 'missing target' });
+          return;
+        }
+
+        if (roomId) {
+          io.to(String(roomId)).emit('start-voice-call', { from: socket.userId || socket.id, metadata });
+          if (typeof ack === 'function') ack({ ok: true });
+          return;
+        }
+
+        const targets = onlineUsers.getSocketIds(String(to)) || [];
+        if (targets.length === 0) {
+          if (typeof ack === 'function') ack({ ok: false, message: 'user offline' });
+          return;
+        }
+
+        targets.forEach(tid => {
+          try { io.to(tid).emit('start-voice-call', { from: socket.userId || socket.id, metadata }); } catch (e) { }
+        });
+        if (typeof ack === 'function') ack({ ok: true });
+      } catch (err) {
+        console.error('start-voice-call error', err);
+        if (typeof ack === 'function') ack({ ok: false, message: 'server error' });
+      }
+    });
+
+    // payload: { to, roomId, chunk }
+    socket.on('voice-chunk', (payload) => {
+      try {
+        if (!payload) return;
+        const chunk = payload.chunk;
+        const to = payload && (payload.to || payload.target || payload.userId);
+        const roomId = payload && payload.roomId;
+        if (!chunk) return;
+
+        if (roomId) {
+          socket.to(String(roomId)).emit('voice-chunk', { from: socket.userId || socket.id, chunk });
+          return;
+        }
+
+        const targets = onlineUsers.getSocketIds(String(to)) || [];
+        targets.forEach(tid => {
+          try { io.to(tid).emit('voice-chunk', { from: socket.userId || socket.id, chunk }); } catch (e) { }
+        });
+      } catch (err) { console.error('voice-chunk relay error', err) }
+    });
+
+    socket.on('stop-voice-call', (payload) => {
+      try {
+        const to = payload && (payload.to || payload.target || payload.userId);
+        const roomId = payload && payload.roomId;
+        const reason = payload && payload.reason;
+        if (!to && !roomId) return;
+
+        if (roomId) {
+          io.to(String(roomId)).emit('stop-voice-call', { from: socket.userId || socket.id, reason });
+          return;
+        }
+
+        const targets = onlineUsers.getSocketIds(String(to)) || [];
+        targets.forEach(tid => {
+          try { io.to(tid).emit('stop-voice-call', { from: socket.userId || socket.id, reason }); } catch (e) { }
+        });
+      } catch (err) { console.error('stop-voice-call error', err) }
+    });
 
     // Validation: reject if receiver is missing or same as sender
     if (!to) {
@@ -348,172 +508,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // --------------------------
-  // Voice call (WebRTC) signaling
-  // --------------------------
-  // Client -> server: 'call-user' { to: <userId>, offer, metadata }
-  // Server -> target: 'incoming-call' { from, offer, metadata }
-  socket.on('call-user', (payload, ack) => {
-    try {
-      console.log('call-user event received from socket:', socket.id, 'userId:', socket.userId, 'payload keys:', Object.keys(payload || {}));
-      const to = payload && (payload.to || payload.userId || payload.target);
-      const offer = payload && payload.offer;
-      const metadata = payload && payload.metadata;
-      if (!to) {
-        console.log('call-user: missing target in payload');
-        return typeof ack === 'function' ? ack({ ok: false, message: 'missing target' }) : null;
-      }
-
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      console.log('call-user: resolved targets for', to, targets);
-      if (targets.length === 0) {
-        console.log('call-user: target is offline or has no sockets:', to);
-        if (typeof ack === 'function') ack({ ok: false, message: 'user offline' });
-        return;
-      }
-
-      targets.forEach(tid => {
-        try {
-          io.to(tid).emit('incoming-call', { from: String(socket.userId || null), offer, metadata });
-          console.log('call-user: emitted incoming-call to socket', tid);
-        } catch (e) { console.error('incoming-call emit error', e) }
-      });
-      if (typeof ack === 'function') ack({ ok: true });
-    } catch (err) {
-      console.error('call-user handler error', err);
-      if (typeof ack === 'function') ack({ ok: false, message: 'server error' });
-    }
-  });
-
-  // Alias handlers to support different client event names
-  const handleCallOffer = (payload, ack) => {
-    try {
-      // Reuse same semantics as 'call-user'
-      const to = payload && (payload.to || payload.userId || payload.target || payload.receiver);
-      const offer = payload && (payload.offer || payload.sdp || payload.description);
-      const metadata = payload && payload.metadata;
-      if (!to) return typeof ack === 'function' ? ack({ ok: false, message: 'missing target' }) : null;
-
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      if (targets.length === 0) {
-        if (typeof ack === 'function') ack({ ok: false, message: 'user offline' });
-        console.log(`call-offer: target ${to} offline`);
-        return;
-      }
-
-      targets.forEach(tid => {
-        try {
-          io.to(tid).emit('incoming-call', { from: String(socket.userId || null), offer, metadata });
-        } catch (e) { console.error('incoming-call emit error (alias)', e) }
-      });
-      if (typeof ack === 'function') ack({ ok: true });
-      console.log(`call-offer: forwarded offer from ${socket.userId} to ${to} sockets:`, targets);
-    } catch (err) {
-      console.error('call-offer handler error', err);
-      if (typeof ack === 'function') ack({ ok: false, message: 'server error' });
-    }
-  };
-
-  socket.on('call-offer', handleCallOffer);
-  socket.on('offer', handleCallOffer);
-  socket.on('call', handleCallOffer);
-
-  // Client -> server: 'answer-call' { to: <userId>, answer }
-  // Server -> target: 'call-accepted' { from, answer }
-  socket.on('answer-call', (payload, ack) => {
-    try {
-      const to = payload && (payload.to || payload.userId || payload.target);
-      const answer = payload && payload.answer;
-      if (!to) return typeof ack === 'function' ? ack({ ok: false, message: 'missing target' }) : null;
-
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      targets.forEach(tid => {
-        try { io.to(tid).emit('call-accepted', { from: String(socket.userId || null), answer }); } catch (e) { console.error('call-accepted emit error', e) }
-      });
-      if (typeof ack === 'function') ack({ ok: true });
-    } catch (err) {
-      console.error('answer-call handler error', err);
-      if (typeof ack === 'function') ack({ ok: false, message: 'server error' });
-    }
-  });
-
-  // Client -> server: 'ice-candidate' { to: <userId>, candidate }
-  // Server -> target: 'ice-candidate' { from, candidate }
-  socket.on('ice-candidate', (payload) => {
-    try {
-      const to = payload && (payload.to || payload.userId || payload.target);
-      const candidate = payload && payload.candidate;
-      if (!to || !candidate) return;
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      targets.forEach(tid => {
-        try { io.to(tid).emit('ice-candidate', { from: String(socket.userId || null), candidate }); } catch (e) { console.error('ice-candidate emit error', e) }
-      });
-    } catch (err) { console.error('ice-candidate handler error', err) }
-  });
-
-  // Client -> server: 'end-call' { to: <userId>, reason }
-  // Server -> target: 'call-ended' { from, reason }
-  socket.on('end-call', (payload) => {
-    try {
-      const to = payload && (payload.to || payload.userId || payload.target);
-      const reason = payload && payload.reason;
-      if (!to) return;
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      targets.forEach(tid => {
-        try { io.to(tid).emit('call-ended', { from: String(socket.userId || null), reason }); } catch (e) { console.error('call-ended emit error', e) }
-      });
-    } catch (err) { console.error('end-call handler error', err) }
-  });
-
-  // --------------------------
-  // Audio stream relay (simple Socket.IO binary relay)
-  // Note: This relays audio data via Socket.IO and is NOT a production SFU/TURN solution.
-  // Clients should send small binary chunks (ArrayBuffer/Buffer) in 'audio-chunk' events.
-  // --------------------------
-  socket.on('start-audio-stream', (payload, ack) => {
-    try {
-      const to = payload && (payload.to || payload.target || payload.userId);
-      const metadata = payload && payload.metadata;
-      if (!to) return typeof ack === 'function' ? ack({ ok: false, message: 'missing target' }) : null;
-
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      const fromId = String(socket.userId || null);
-      targets.forEach(tid => {
-        try { io.to(tid).emit('start-audio-stream', { from: fromId, metadata }); } catch (e) { console.error('start-audio-stream emit error', e) }
-      });
-      if (typeof ack === 'function') ack({ ok: true });
-    } catch (err) {
-      console.error('start-audio-stream handler error', err);
-      if (typeof ack === 'function') ack({ ok: false, message: 'server error' });
-    }
-  });
-
-  // payload: { to, chunk }
-  socket.on('audio-chunk', (payload) => {
-    try {
-      const to = payload && (payload.to || payload.target || payload.userId);
-      const chunk = payload && payload.chunk;
-      if (!to || !chunk) return;
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      const fromId = String(socket.userId || null);
-      targets.forEach(tid => {
-        try { io.to(tid).emit('audio-chunk', { from: fromId, chunk }); } catch (e) { console.error('audio-chunk emit error', e) }
-      });
-    } catch (err) { console.error('audio-chunk handler error', err) }
-  });
-
-  socket.on('stop-audio-stream', (payload) => {
-    try {
-      const to = payload && (payload.to || payload.target || payload.userId);
-      const reason = payload && payload.reason;
-      if (!to) return;
-      const targets = onlineUsers.getSocketIds(String(to)) || [];
-      const fromId = String(socket.userId || null);
-      targets.forEach(tid => {
-        try { io.to(tid).emit('stop-audio-stream', { from: fromId, reason }); } catch (e) { console.error('stop-audio-stream emit error', e) }
-      });
-    } catch (err) { console.error('stop-audio-stream handler error', err) }
-  });
+  // (call-related signaling & audio streaming handlers removed)
 
   socket.on("disconnect", () => {
     const userId = socket.userId;
